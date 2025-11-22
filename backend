@@ -1,1 +1,150 @@
+// backend/server.js
+require('dotenv').config();
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 
+const app = express();
+app.use(express.json());
+app.use(cors());
+
+// --- DATABASE CONFIG ---
+const MONGO_URI = process.env.MONGO_URI || 'mongodb://localhost:27017/zoomlocker';
+const JWT_SECRET = 'super_secret_key_change_this';
+
+mongoose.connect(MONGO_URI)
+  .then(() => console.log('MongoDB Connected'))
+  .catch(err => console.log(err));
+
+// --- MODELS ---
+const UserSchema = new mongoose.Schema({
+  username: { type: String, unique: true, required: true },
+  password: { type: String, required: true },
+  role: { type: String, enum: ['owner', 'client'], default: 'client' },
+  isActive: { type: Boolean, default: true },
+  allowedRecordings: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Recording' }]
+});
+
+const RecordingSchema = new mongoose.Schema({
+  title: String,
+  link: String,
+  isPublic: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now }
+});
+
+const HistorySchema = new mongoose.Schema({
+  username: String,
+  recordingTitle: String,
+  watchedAt: { type: Date, default: Date.now }
+});
+
+const User = mongoose.model('User', UserSchema);
+const Recording = mongoose.model('Recording', RecordingSchema);
+const History = mongoose.model('History', HistorySchema);
+
+// --- SEEDER (Default Owner) ---
+const seedOwner = async () => {
+  const exists = await User.findOne({ username: 'owner' });
+  if (!exists) {
+    const hashedPassword = await bcrypt.hash('mystery1234', 10);
+    await User.create({ username: 'owner', password: hashedPassword, role: 'owner' });
+    console.log('Default Owner Created: owner / mystery1234');
+  }
+};
+seedOwner();
+
+// --- MIDDLEWARE ---
+const authenticate = (req, res, next) => {
+  const token = req.headers.authorization;
+  if (!token) return res.status(401).json({ message: 'Unauthorized' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (err) {
+    res.status(403).json({ message: 'Invalid Token' });
+  }
+};
+
+const isOwner = (req, res, next) => {
+  if (req.user.role !== 'owner') return res.status(403).json({ message: 'Access Denied' });
+  next();
+};
+
+// --- ROUTES ---
+
+// 1. Auth
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+  const user = await User.findOne({ username });
+  
+  if (!user || !user.isActive) return res.status(400).json({ message: 'Invalid user or account disabled' });
+  
+  const isMatch = await bcrypt.compare(password, user.password);
+  if (!isMatch) return res.status(400).json({ message: 'Invalid credentials' });
+
+  const token = jwt.sign({ id: user._id, role: user.role, username: user.username }, JWT_SECRET);
+  res.json({ token, role: user.role, username: user.username });
+});
+
+// 2. Recordings
+// Get Recordings (Logic varies by role)
+app.get('/api/recordings', authenticate, async (req, res) => {
+  if (req.user.role === 'owner') {
+    const all = await Recording.find();
+    return res.json(all);
+  }
+  
+  // If Client: Get Public OR Assigned
+  const user = await User.findById(req.user.id);
+  const recordings = await Recording.find({
+    $or: [
+      { isPublic: true },
+      { _id: { $in: user.allowedRecordings } }
+    ]
+  });
+  res.json(recordings);
+});
+
+// Add Recording (Owner)
+app.post('/api/recordings', authenticate, isOwner, async (req, res) => {
+  const newRec = new Recording(req.body);
+  await newRec.save();
+  res.json(newRec);
+});
+
+// 3. User Management (Owner)
+app.post('/api/users', authenticate, isOwner, async (req, res) => {
+  const { username, password, role } = req.body;
+  const hashedPassword = await bcrypt.hash(password, 10);
+  const newUser = new User({ username, password: hashedPassword, role });
+  await newUser.save();
+  res.json(newUser);
+});
+
+app.get('/api/users', authenticate, isOwner, async (req, res) => {
+  const users = await User.find({ username: { $ne: 'owner' } }); // Don't show main owner
+  res.json(users);
+});
+
+app.put('/api/users/:id/assign', authenticate, isOwner, async (req, res) => {
+  const { recordingId } = req.body;
+  await User.findByIdAndUpdate(req.params.id, { $addToSet: { allowedRecordings: recordingId } });
+  res.json({ message: 'Access Granted' });
+});
+
+// 4. History & Logging
+app.post('/api/history', authenticate, async (req, res) => {
+  const { recordingTitle } = req.body;
+  await History.create({ username: req.user.username, recordingTitle });
+  res.json({ message: 'Logged' });
+});
+
+app.get('/api/history', authenticate, isOwner, async (req, res) => {
+  const history = await History.find().sort({ watchedAt: -1 });
+  res.json(history);
+});
+
+app.listen(5000, () => console.log('Server running on port 5000'));
